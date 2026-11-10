@@ -1,0 +1,78 @@
+{
+	"name": "@awilixify/fastify",
+	"version": "0.1.0",
+	"description": "Fastify HTTP controllers with configurable request handling for Awilixify.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/awilixify/awilixify-fastify.git"
+	},
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./typebox": {
+			"types": "./dist/lib/typebox.d.ts",
+			"import": "./dist/lib/typebox.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"sideEffects": false,
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"build:watch": "tsc -p tsconfig.build.json --watch",
+		"build:release": "npm run lint && npm run check-types && npm test && npm run build",
+		"check-types": "tsc --noEmit",
+		"lint": "biome check index.ts lib test",
+		"lint:fix": "biome check --write index.ts lib test",
+		"test": "npm run test:runtime && npm run test:types",
+		"test:runtime": "vitest run",
+		"test:types": "tstyche",
+		"test:watch": "vitest",
+		"prepack": "npm run build:release"
+	},
+	"peerDependencies": {
+		"awilixify": "^3.4.0",
+		"fastify": "^5.0.0",
+		"@sinclair/typebox": "^0.34.15"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.6.4",
+		"@types/node": "^22.15.21",
+		"awilix": "^13.0.0",
+		"awilixify": "^3.4.0",
+		"tstyche": "^7.2.5",
+		"typescript": "^5.9.3",
+		"vitest": "^5.0.5",
+		"@swc/core": "^1.15.33",
+		"unplugin-swc": "^1.5.9",
+		"fastify": "^5.8.2",
+		"@sinclair/typebox": "^0.34.15"
+	},
+	"keywords": [
+		"awilixify",
+		"fastify",
+		"http",
+		"dependency-injection",
+		"typescript"
+	],
+	"peerDependenciesMeta": {
+		"@sinclair/typebox": {
+			"optional": true
+		}
+	}
+}
