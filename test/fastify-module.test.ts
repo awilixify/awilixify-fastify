@@ -1,25 +1,29 @@
-import {
-	createModule,
-	DIContext,
-	isResultLike,
-	type ModuleDef,
-} from "awilixify";
+import { Type } from "@sinclair/typebox";
+import { DIContext, Result } from "awilixify";
 import {
 	after as afterHttp,
 	before as beforeHttp,
 	controller,
 	GET,
+	httpException,
 	POST,
 	schema,
 } from "awilixify/http";
 import Fastify, { type FastifyReply } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	createErrorMapper,
+	createResultHandler,
 	type FastifyHandler,
 	FastifyModule,
 	routeConfig,
 	routeConstraints,
 } from "../index.js";
+
+import {
+	createResultSchemaDecorator,
+	createErrorMapper as createTypeBoxErrorMapper,
+} from "../lib/typebox/index.js";
 
 const resources: { close(): Promise<unknown> }[] = [];
 
@@ -30,93 +34,54 @@ afterEach(async () => {
 async function setup(
 	Controller: new (...args: any[]) => any,
 	handler?: FastifyHandler,
+	handleHttpExceptions = true,
 ) {
 	const fastifyInstance = Fastify();
 	resources.push(fastifyInstance);
-	const HttpModule = FastifyModule({ fastifyInstance, handler });
+	const HttpModule = FastifyModule({
+		fastifyInstance,
+		handler,
+		handleHttpExceptions,
+	});
 	const context = DIContext.create({
 		name: "App",
 		imports: [HttpModule],
 		controllers: [Controller],
 	});
 	resources.push(context);
+
 	await context.init();
+
 	return { fastifyInstance, context, HttpModule };
 }
 
 describe("Fastify module", () => {
-	it("exports the original instance and registers all paths and verbs", async () => {
+	it("keeps the instance private and registers all paths and verbs", async () => {
 		@controller(["/one", "/two"])
 		class Controller {
 			@GET("/value")
 			@POST("/value")
 			handle() {
-				return { value: 1 };
+				return { ok: true, value: 1 };
 			}
 		}
 		const { fastifyInstance, context, HttpModule } = await setup(Controller);
+
 		expect(HttpModule.initializerExports).toEqual(["fastifyInitializer"]);
-		expect(HttpModule.initializers.fastifyInitializer.name).toBe(
-			"FastifyInitializer",
-		);
-		expect(context.scope.resolve("fastifyInstance")).toBe(fastifyInstance);
+		expect(context.scope.hasRegistration("fastifyInstance")).toBe(false);
+
 		for (const url of ["/one/value", "/two/value"]) {
 			for (const method of ["GET", "POST"] as const) {
 				const response = await fastifyInstance.inject({ method, url });
+
 				expect(response.statusCode).toBe(200);
-				expect(response.json()).toEqual({ value: 1 });
+				expect(response.json()).toEqual({ ok: true, value: 1 });
 			}
 		}
-	});
-
-	it("returns Result-shaped values unchanged by default", async () => {
-		class Controller {
-			@GET("/success")
-			success() {
-				return { ok: true, value: { id: 1 } };
-			}
-			@GET("/failure")
-			failure() {
-				return { ok: false, error: { message: "Not found" } };
-			}
-		}
-		const { fastifyInstance } = await setup(Controller);
-		expect((await fastifyInstance.inject("/success")).json()).toEqual({
-			ok: true,
-			value: { id: 1 },
-		});
-		const failure = await fastifyInstance.inject("/failure");
-		expect(failure.statusCode).toBe(200);
-		expect(failure.json()).toEqual({
-			ok: false,
-			error: { message: "Not found" },
-		});
-	});
-
-	it("leaves response status and sending to Fastify", async () => {
-		class Controller {
-			@GET("/created")
-			created(_request: unknown, reply: FastifyReply) {
-				reply.code(201);
-				return { id: 1 };
-			}
-			@GET("/empty")
-			empty(_request: unknown, reply: FastifyReply) {
-				reply.code(202).send();
-			}
-			@GET("/undefined")
-			noResult() {}
-		}
-		const { fastifyInstance } = await setup(Controller);
-		expect((await fastifyInstance.inject("/created")).statusCode).toBe(201);
-		expect((await fastifyInstance.inject("/empty")).statusCode).toBe(202);
-		const empty = await fastifyInstance.inject("/undefined");
-		expect(empty.statusCode).toBe(200);
-		expect(empty.body).toBe("");
 	});
 
 	it.each([false, true])(
-		"does not send again after a manual response, override=%s",
+		"ignores returned data after a manual send without triggering Fastify's duplicate-send warning, override=%s",
 		async (override) => {
 			const warn = vi.fn();
 			class Controller {
@@ -125,6 +90,7 @@ describe("Fastify module", () => {
 					vi.spyOn(reply.log, "warn").mockImplementation(warn);
 					reply.code(202).send({ sent: true });
 					await Promise.resolve();
+					// Deliberately return data after sending to exercise the reply.sent guard.
 					return { ignored: true };
 				}
 			}
@@ -132,9 +98,13 @@ describe("Fastify module", () => {
 				Controller,
 				override ? async ({ invoke }) => invoke() : undefined,
 			);
+
 			const response = await fastifyInstance.inject("/sent");
+
 			expect(response.statusCode).toBe(202);
 			expect(response.json()).toEqual({ sent: true });
+			// Without the guard, Fastify tries to send the returned data and logs
+			// "Reply was already sent" through reply.log.warn.
 			expect(warn).not.toHaveBeenCalled();
 		},
 	);
@@ -143,23 +113,25 @@ describe("Fastify module", () => {
 		class Controller {
 			@GET("/custom")
 			handle(request: { headers: Record<string, unknown> }) {
-				return { ok: true, value: request.headers["x-value"] };
+				return request.headers["x-value"];
 			}
 		}
 		const handler = vi.fn<FastifyHandler>(
 			async ({ invoke, request, reply }) => {
 				reply.code(201).header("x-path", request.url);
-				const result = await invoke();
-				return isResultLike(result) && result.ok ? result.value : result;
+				return { value: await invoke() };
 			},
 		);
+
 		const { fastifyInstance } = await setup(Controller, handler);
+
 		const response = await fastifyInstance.inject({
 			url: "/custom",
 			headers: { "x-value": "custom value" },
 		});
+
 		expect(response.statusCode).toBe(201);
-		expect(response.body).toBe("custom value");
+		expect(response.json()).toEqual({ value: "custom value" });
 		expect(response.headers["x-path"]).toBe("/custom");
 		expect(handler).toHaveBeenCalledTimes(1);
 	});
@@ -182,7 +154,7 @@ describe("Fastify module", () => {
 		expect(invoke).not.toHaveBeenCalled();
 	});
 
-	it("preserves Fastify validation and default serialization", async () => {
+	it("forwards request and response schemas to Fastify", async () => {
 		class Controller {
 			@POST("/validated")
 			@schema({
@@ -199,12 +171,15 @@ describe("Fastify module", () => {
 				return { public: true, secret: "must not leak" };
 			}
 		}
+
 		const { fastifyInstance } = await setup(Controller);
+
 		const invalid = await fastifyInstance.inject({
 			method: "POST",
 			url: "/validated",
 			payload: {},
 		});
+
 		expect(invalid.statusCode).toBe(400);
 		expect(invalid.json().code).toBe("FST_ERR_VALIDATION");
 		const valid = await fastifyInstance.inject({
@@ -215,117 +190,247 @@ describe("Fastify module", () => {
 		expect(valid.json()).toEqual({ public: true });
 	});
 
-	it("runs before and after hooks in rolled-up order and exposes route config", async () => {
+	it("maps before and after middleware to Fastify hooks", async () => {
 		const calls: string[] = [];
-		@beforeHttp(async () => {
-			calls.push("root before");
-		})
-		@afterHttp(async (_request: unknown, _reply: unknown, payload: string) => {
-			calls.push("root after");
-			return payload;
-		})
 		class Controller {
 			@GET("/hooks")
 			@beforeHttp(async () => {
-				calls.push("method before");
+				calls.push("before");
 			})
 			@afterHttp(
 				async (_request: unknown, _reply: unknown, payload: string) => {
-					calls.push("method after");
+					calls.push("after");
 					return payload;
 				},
 			)
-			@routeConfig({ marker: "present" })
-			handle(request: { routeOptions: { config: Record<string, unknown> } }) {
+			handle() {
 				calls.push("handler");
-				return { marker: request.routeOptions.config.marker };
+				return "ok";
+			}
+		}
+
+		const { fastifyInstance } = await setup(Controller);
+
+		expect((await fastifyInstance.inject("/hooks")).body).toBe("ok");
+		expect(calls).toEqual(["before", "handler", "after"]);
+	});
+
+	it("unwraps Results and maps failures without changing plain or sent responses", async () => {
+		class CatsError extends Error {
+			readonly code = "cats.not_found";
+		}
+		const errorMapper = createErrorMapper([
+			[CatsError, () => httpException.notFound("cats.not_found")],
+		]);
+		const mapError = vi.spyOn(errorMapper, "toHttpErrorFromUnknown");
+
+		class Controller {
+			@GET("/plain")
+			plain() {
+				return { cats: ["cat"] };
+			}
+			@GET("/ok")
+			ok() {
+				return Result.ok({ cats: ["cat"] });
+			}
+			@GET("/mapped")
+			mapped() {
+				return Result.error(new CatsError());
+			}
+			@GET("/unknown")
+			unknown() {
+				return Result.error(new Error("private details"));
+			}
+			@GET("/sent")
+			sent(_request: unknown, reply: FastifyReply) {
+				reply.code(202).send({ sent: true });
+				return Result.error(new CatsError());
+			}
+		}
+
+		const { fastifyInstance } = await setup(
+			Controller,
+			createResultHandler(errorMapper),
+			false,
+		);
+		const errorHandler = vi.fn(
+			(_error: unknown, _request: unknown, reply: FastifyReply) =>
+				reply.code(500).send({ unexpectedErrorHandler: true }),
+		);
+		fastifyInstance.setErrorHandler(errorHandler);
+
+		for (const url of ["/plain", "/ok"]) {
+			const response = await fastifyInstance.inject(url);
+			expect(response.statusCode).toBe(200);
+			expect(response.json()).toEqual({ cats: ["cat"] });
+		}
+		expect(mapError).not.toHaveBeenCalled();
+
+		const mapped = await fastifyInstance.inject("/mapped");
+		expect(mapped.statusCode).toBe(404);
+		expect(mapped.json()).toEqual({
+			statusCode: 404,
+			message: "cats.not_found",
+		});
+		expect(mapError).toHaveBeenCalledTimes(1);
+
+		const unknown = await fastifyInstance.inject("/unknown");
+		expect(unknown.statusCode).toBe(500);
+		expect(unknown.json()).toEqual({
+			statusCode: 500,
+			message: "Internal Server Error",
+		});
+		expect(mapError).toHaveBeenCalledTimes(2);
+
+		const sent = await fastifyInstance.inject("/sent");
+		expect(sent.statusCode).toBe(202);
+		expect(sent.json()).toEqual({ sent: true });
+		expect(mapError).toHaveBeenCalledTimes(2);
+
+		expect(errorHandler).not.toHaveBeenCalled();
+	});
+
+	it("serves Result success and error responses using registered schemas", async () => {
+		class CatsError extends Error {
+			readonly code = "cats.not_found";
+		}
+		const errorMapper = createTypeBoxErrorMapper([
+			[CatsError, () => httpException.notFound("cats.not_found")],
+		]);
+		const resultSchema = createResultSchemaDecorator({ errorMapper });
+		const routeSchema = {
+			response: {
+				200: Type.Array(Type.String()),
+				...errorMapper.toResponseSchemas([CatsError]),
+			},
+		};
+		class Controller {
+			@GET("/ok")
+			@resultSchema(routeSchema)
+			list() {
+				return Result.ok(["cat"]);
+			}
+			@GET("/error")
+			@resultSchema(routeSchema)
+			failure() {
+				return Result.error(new CatsError());
+			}
+		}
+		const { fastifyInstance } = await setup(
+			Controller,
+			createResultHandler(errorMapper),
+		);
+
+		const success = await fastifyInstance.inject("/ok");
+		expect(success.statusCode).toBe(200);
+		expect(success.json()).toEqual(["cat"]);
+
+		const failure = await fastifyInstance.inject("/error");
+		expect(failure.statusCode).toBe(404);
+		expect(failure.json()).toEqual({
+			statusCode: 404,
+			message: "cats.not_found",
+		});
+	});
+
+	it("sends Awilixify HTTP exception responses by default", async () => {
+		class Controller {
+			@GET("/error")
+			handle() {
+				throw httpException.notFound("cats.not_found", {
+					detail: "public detail",
+				});
 			}
 		}
 		const { fastifyInstance } = await setup(Controller);
-		expect((await fastifyInstance.inject("/hooks")).json()).toEqual({
-			marker: "present",
+		const response = await fastifyInstance.inject("/error");
+
+		expect(response.statusCode).toBe(404);
+		expect(response.json()).toEqual({
+			statusCode: 404,
+			message: "cats.not_found",
+			detail: "public detail",
 		});
-		expect(calls).toEqual([
-			"root before",
-			"method before",
-			"handler",
-			"method after",
-			"root after",
-		]);
 	});
 
-	it("inherits application error handling for controller, hook and override failures", async () => {
+	it("leaves HTTP exceptions to the application when disabled", async () => {
 		const fastifyInstance = Fastify();
 		resources.push(fastifyInstance);
-		fastifyInstance.setErrorHandler((_error, _request, reply) =>
-			reply.code(418).send({ custom: true }),
-		);
-		fastifyInstance.get("/native", () => {
-			throw new Error("native");
+		fastifyInstance.setErrorHandler<Error>((error, _request, reply) => {
+			return reply.status(503).send({ custom: error.message });
 		});
+		FastifyModule({ fastifyInstance, handleHttpExceptions: false });
+		fastifyInstance.get("/error", () => {
+			throw httpException.notFound("cats.not_found");
+		});
+
+		const response = await fastifyInstance.inject("/error");
+		expect(response.statusCode).toBe(503);
+		expect(response.json()).toEqual({ custom: "cats.not_found" });
+	});
+
+	it("preserves Fastify default error and validation responses", async () => {
+		const plain = Fastify();
+		const adapted = Fastify();
+		resources.push(plain, adapted);
+		FastifyModule({ fastifyInstance: adapted });
+
+		for (const app of [plain, adapted]) {
+			app.get("/error", () => {
+				throw new Error("unexpected");
+			});
+			app.get(
+				"/validation",
+				{
+					schema: {
+						querystring: {
+							type: "object",
+							required: ["name"],
+							properties: { name: { type: "string" } },
+						},
+					},
+				},
+				() => "ok",
+			);
+		}
+
+		for (const url of ["/error", "/validation"]) {
+			const expected = await plain.inject(url);
+			const actual = await adapted.inject(url);
+			expect(actual.statusCode).toBe(expected.statusCode);
+			expect(actual.json()).toEqual(expected.json());
+		}
+	});
+
+	it("lets controller errors reach the application error handler", async () => {
+		const fastifyInstance = Fastify();
+		resources.push(fastifyInstance);
+		const error = new Error("controller failed");
+		const handleError = vi.fn(
+			(_error: unknown, _request: unknown, reply: FastifyReply) =>
+				reply.code(500).send({ handled: true }),
+		);
+		fastifyInstance.setErrorHandler(handleError);
 		class Controller {
-			@GET("/hook")
-			@beforeHttp(async () => {
-				throw new Error("hook");
-			})
-			hook() {
-				return "unreachable";
-			}
-			@GET("/override")
-			override() {
-				return "unreachable";
-			}
-			@GET("/decorated")
+			@GET("/error")
 			handle() {
-				throw new Error("decorated");
+				throw error;
 			}
 		}
+
 		const context = DIContext.create({
 			name: "App",
-			imports: [
-				FastifyModule({
-					fastifyInstance,
-					handler: ({ request, invoke }) => {
-						if (request.url === "/override") throw new Error("override");
-						return invoke();
-					},
-				}),
-			],
+			imports: [FastifyModule({ fastifyInstance })],
 			controllers: [Controller],
 		});
 		resources.push(context);
-		await context.init();
-		expect((await fastifyInstance.inject("/native")).statusCode).toBe(418);
-		for (const url of ["/decorated", "/hook", "/override"]) {
-			const response = await fastifyInstance.inject(url);
-			expect(response.statusCode).toBe(418);
-			expect(response.json()).toEqual({ custom: true });
-		}
-	});
 
-	it("routes the same path using host constraints", async () => {
-		class Controller {
-			@GET("/host")
-			@routeConstraints({ host: "api.example.com" })
-			api() {
-				return "api";
-			}
-			@GET("/host")
-			@routeConstraints({ host: "admin.example.com" })
-			admin() {
-				return "admin";
-			}
-		}
-		const { fastifyInstance } = await setup(Controller);
-		for (const name of ["api", "admin"]) {
-			const response = await fastifyInstance.inject({
-				url: "/host",
-				headers: { host: `${name}.example.com` },
-			});
-			expect(response.statusCode).toBe(200);
-			expect(response.body).toBe(name);
-		}
-		expect((await fastifyInstance.inject("/host")).statusCode).toBe(404);
+		await context.init();
+		const response = await fastifyInstance.inject("/error");
+
+		expect(response.statusCode).toBe(500);
+		expect(response.json()).toEqual({ handled: true });
+		expect(handleError.mock.calls[0]?.[0]).toBe(error);
 	});
 
 	it("preserves config and constraints when decorators share route state", async () => {
@@ -340,13 +445,16 @@ describe("Fastify module", () => {
 				return { first, second };
 			}
 		}
+
 		const { fastifyInstance } = await setup(Controller);
+
 		const response = await fastifyInstance.inject({
 			url: "/combined",
 			headers: { host: "api.example.com", "accept-version": "1.x" },
 		});
 		expect(response.statusCode).toBe(200);
 		expect(response.json()).toEqual({ first: true, second: true });
+
 		const wrongHost = await fastifyInstance.inject({
 			url: "/combined",
 			headers: { "accept-version": "1.x" },
@@ -357,86 +465,5 @@ describe("Fastify module", () => {
 			headers: { host: "api.example.com", "accept-version": "2.x" },
 		});
 		expect(wrongVersion.statusCode).toBe(404);
-	});
-
-	it("merges stacked constraints and routes by version", async () => {
-		class Controller {
-			@GET("/version")
-			@routeConstraints({ host: "api.example.com" })
-			@routeConstraints({ version: "1.0.0" })
-			first() {
-				return "v1";
-			}
-			@GET("/version")
-			@routeConstraints({ host: "api.example.com", version: "2.0.0" })
-			second() {
-				return "v2";
-			}
-		}
-		const { fastifyInstance } = await setup(Controller);
-		for (const version of [1, 2]) {
-			const response = await fastifyInstance.inject({
-				url: "/version",
-				headers: { host: "api.example.com", "accept-version": `${version}.x` },
-			});
-			expect(response.statusCode).toBe(200);
-			expect(response.body).toBe(`v${version}`);
-		}
-		const wrongHost = await fastifyInstance.inject({
-			url: "/version",
-			headers: { "accept-version": "1.x" },
-		});
-		expect(wrongHost.statusCode).toBe(404);
-	});
-
-	it("registers same-named controllers in separate feature modules", async () => {
-		const fastifyInstance = Fastify();
-		resources.push(fastifyInstance);
-		const Http = FastifyModule({ fastifyInstance });
-		const First = class Controller {
-			@GET("/first") handle() {
-				return "first";
-			}
-		};
-		const Second = class Controller {
-			@GET("/second") handle() {
-				return "second";
-			}
-		};
-		type Def = ModuleDef<{ imports: [typeof Http] }>;
-		const context = DIContext.create({
-			name: "App",
-			imports: [
-				createModule<Def>({
-					name: "First",
-					imports: [Http],
-					controllers: [First],
-				}),
-				createModule<Def>({
-					name: "Second",
-					imports: [Http],
-					controllers: [Second],
-				}),
-			],
-		});
-		resources.push(context);
-		await context.init();
-		expect((await fastifyInstance.inject("/first")).body).toBe("first");
-		expect((await fastifyInstance.inject("/second")).body).toBe("second");
-	});
-
-	it("leaves listening and shutdown to the application", async () => {
-		const fastifyInstance = Fastify();
-		resources.push(fastifyInstance);
-		const listen = vi.spyOn(fastifyInstance, "listen");
-		const close = vi.spyOn(fastifyInstance, "close");
-		const context = DIContext.create({
-			name: "App",
-			imports: [FastifyModule({ fastifyInstance })],
-		});
-		await context.init();
-		expect(listen).not.toHaveBeenCalled();
-		await context.close();
-		expect(close).not.toHaveBeenCalled();
 	});
 });

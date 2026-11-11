@@ -16,8 +16,8 @@
 			"import": "./dist/index.js"
 		},
 		"./typebox": {
-			"types": "./dist/lib/typebox.d.ts",
-			"import": "./dist/lib/typebox.js"
+			"types": "./dist/lib/typebox/index.d.ts",
+			"import": "./dist/lib/typebox/index.js"
 		}
 	},
 	"files": [

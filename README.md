@@ -1,6 +1,6 @@
 # @awilixify/fastify
 
-Fastify HTTP controllers for Awilixify, with an optional request-handler override.
+Register Awilixify controllers as Fastify routes. Optionally add typed TypeBox schemas and map application Result errors to HTTP responses.
 
 ## Install
 
@@ -8,50 +8,117 @@ Fastify HTTP controllers for Awilixify, with an optional request-handler overrid
 npm install @awilixify/fastify awilixify awilix fastify
 ```
 
-Requires Node.js 22+, Awilixify 3.4, and Fastify 5. TypeScript examples use standard decorators, not `experimentalDecorators`.
+## Quick start
 
-## Usage
+Let an infrastructure module own the Fastify instance and server lifecycle:
 
 ```ts
-import { DIContext } from "awilixify";
-import { controller, GET } from "awilixify/http";
-import { FastifyModule } from "@awilixify/fastify";
-import Fastify from "fastify";
+// http-infra.module.ts
+import { Lifetime } from "awilix";
+import { createModule, type ModuleDef } from "awilixify";
+import Fastify, { type FastifyInstance } from "fastify";
 
-const fastifyInstance = Fastify({ logger: true });
-const HttpModule = FastifyModule({ fastifyInstance });
+class HttpServer {
+  constructor(private readonly fastifyInstance: FastifyInstance) {}
+
+  onInit() {
+    // Register application plugins here, before controller routes are added.
+    // Do not call ready(), inject(), or listen() in this phase.
+  }
+
+  async afterInit() {
+    await this.fastifyInstance.listen({ port: 3000 });
+  }
+
+  async beforeShutdown() {
+    await this.fastifyInstance.close();
+  }
+}
+
+type HttpInfraModuleDef = ModuleDef<{
+  providers: {
+    fastifyInstance: FastifyInstance;
+    httpServer: HttpServer;
+  };
+  exportKeys: ["fastifyInstance"];
+}>;
+
+export const HttpInfraModule = createModule<HttpInfraModuleDef>({
+  name: "HttpInfraModule",
+  providers: {
+    fastifyInstance: {
+      useFactory: () => Fastify({ logger: true }),
+      lifetime: Lifetime.SINGLETON,
+    },
+    httpServer: {
+      useClass: HttpServer,
+      lifetime: Lifetime.SINGLETON,
+      eager: true,
+    },
+  },
+  exports: ["fastifyInstance"],
+});
+```
+
+Pass that singleton to the integration with `configureModule`:
+
+```ts
+// http.module.ts
+import { FastifyModule } from "@awilixify/fastify";
+import { configureModule } from "awilixify";
+import { HttpInfraModule } from "./http-infra.module.js";
+
+export const HttpModule = configureModule({
+  imports: [HttpInfraModule],
+  inject: ["fastifyInstance"],
+  useFactory: (fastifyInstance) => FastifyModule({ fastifyInstance }),
+});
+```
+
+Configuration imports stay registered through shutdown, even though the returned Fastify module does not import them. `HttpServer` and the integration use the same singleton. Only Fastify's exported initializer becomes global; the instance stays private to the integration and infrastructure modules.
+
+Feature modules declare their own controllers:
+
+```ts
+// users.module.ts
+import { createModule } from "awilixify";
+import { controller, GET } from "awilixify/http";
 
 @controller("/users")
 class UsersController {
-	@GET("/")
-	list() {
-		return [{ id: 1, name: "Ada" }];
-	}
+  @GET("/")
+  list() {
+    return [{ id: 1, name: "Ada" }];
+  }
 }
 
-const context = DIContext.create({
-	name: "App",
-	imports: [HttpModule],
-	controllers: [UsersController],
+export const UsersModule = createModule({
+  name: "UsersModule",
+  controllers: [UsersController],
 });
-
-await context.init();
-await fastifyInstance.listen({ port: 3000 });
-
-// During application shutdown, stop requests before disposing DI resources:
-// await fastifyInstance.close();
-// await context.close();
 ```
 
-The module exports the original instance as `fastifyInstance`, retaining its server, logger and type-provider types. It exports the Fastify initializer as `fastifyInitializer`. Import the same `HttpModule` into each feature module that declares HTTP controllers.
+Register `HttpModule` globally so feature modules don't need HTTP imports:
 
-Configure Fastify options, plugins and hooks on the instance yourself. Register plugins before initializing the DI context, and initialize the context before calling `fastifyInstance.ready()`, `fastifyInstance.inject()` or `fastifyInstance.listen()`.
+```ts
+// main.ts
+import { DIContext } from "awilixify";
+import { HttpModule } from "./http.module.js";
+import { UsersModule } from "./users.module.js";
 
-The integration does not listen automatically, install plugins, choose a schema library, or augment request/context types. Fastify's validation and serialization compilers remain unchanged. TypeBox and other providers can be configured on the supplied instance.
+const context = DIContext.create(
+  { name: "App", imports: [UsersModule] },
+  { globalModules: [HttpModule] },
+);
 
-## TypeBox types
+await context.init();
+```
 
-Install TypeBox to use the optional `Request<S>`, `Reply<S>`, and signature-checked `schema()` decorator:
+Initialization runs `HttpServer.onInit()`, registers controller routes, then runs `HttpServer.afterInit()` to start listening. The integration itself only registers routes and configures request handling; your infrastructure provider owns plugins and server lifecycle.
+
+## Typed schemas
+
+The optional `/typebox` helpers check controller signatures against route schemas. No Fastify TypeBox provider is required.
 
 ```sh
 npm install @sinclair/typebox
@@ -59,132 +126,147 @@ npm install @sinclair/typebox
 
 ```ts
 import { type Request, schema } from "@awilixify/fastify/typebox";
-import { type Static, Type } from "@sinclair/typebox";
-import { GET } from "awilixify/http";
+import { Type } from "@sinclair/typebox";
 
-const getUserSchema = {
-	params: Type.Object({ id: Type.String() }),
-	response: {
-		200: Type.Object({ id: Type.String(), name: Type.String() }),
-	},
+const userSchema = {
+  params: Type.Object({ id: Type.String() }),
+  response: { 200: Type.Object({ id: Type.String() }) },
 };
 
-type GetUserResponse = Static<typeof getUserSchema.response[200]>;
-
 class UsersController {
-	@GET("/users/:id")
-	@schema(getUserSchema)
-	async getUser(request: Request<typeof getUserSchema>): Promise<GetUserResponse> {
-		return { id: request.params.id, name: "Ada" };
-	}
+  @GET("/users/:id")
+  @schema(userSchema)
+  getUser(request: Request<typeof userSchema>) {
+    return { id: request.params.id };
+  }
 }
 ```
 
-The helper infers body, params, query and headers from TypeBox schemas. Missing or non-TypeBox schemas fall back to `unknown`, with native Fastify header types retained. The `/typebox` version of `@schema()` requires the annotated request type to match the schema-derived request in both directions. Broader annotations such as `Request<typeof emptySchema>`, plain `FastifyRequest`, and `any` are rejected for a typed schema. Methods without parameters are allowed. Parameter annotations are still explicit, and matching is structural, not based on schema object identity.
+`Request<S>` types request fields. `schema()` checks request/reply annotations and plain success returns against `response[200]` when inferable.
 
-When a second parameter is declared, the decorator also requires it to match `Reply<typeof routeSchema>`. For a schema without response definitions, `Reply<S>` is the native `FastifyReply`. The decorator delegates runtime registration to `awilixify/http`'s `schema()` and does not check returned payloads; use explicit return types for those.
-
-For manual responses, `Reply<S>` derives payload types from the response schemas:
+For explicit responses, annotate the second parameter as `Reply<typeof userSchema>` and return the reply:
 
 ```ts
-import type { Reply, Request } from "@awilixify/fastify/typebox";
-
-class ManualUsersController {
-	@GET("/users/:id")
-	@schema(getUserSchema)
-	getUser(
-		request: Request<typeof getUserSchema>,
-		reply: Reply<typeof getUserSchema>,
-	) {
-		return reply.code(200).send({ id: request.params.id, name: "Ada" });
-	}
-}
+return reply.code(200).send({ id: request.params.id });
 ```
 
-Calling `.code()` or `.status()` selects the corresponding payload type. Plain `.send()` accepts the union of declared response payloads and does not select a status automatically. Reply inference also supports content-type response schemas through Fastify's native types. Non-TypeBox payload schemas fall back to `unknown`.
+`Reply<S>` checks declared statuses and their response bodies. Use `.code()` or `.status()` to select a response; plain `.send()` doesn't narrow by status
 
-These helpers use only Fastify and TypeBox types. Neither `@fastify/type-provider-typebox` nor `.withTypeProvider()` is needed, and runtime validation and serialization remain unchanged.
+## Results and application errors
 
-TypeBox is an optional peer dependency, only needed when importing the `/typebox` subpath. The root entry point does not export or reference the TypeBox helpers.
-
-## Request handling
-
-By default, the route handler invokes the controller with the native Fastify request and reply and returns its result. After either the default invocation or a custom handler, an already-sent or hijacked reply is returned instead of the result to prevent a second send. There is no Result unwrapping, error mapping, status selection, or route-level error handler. A returned `{ ok, value/error }` object is sent as-is.
-
-Fastify controls response serialization and error handling. Use `fastifyInstance.setErrorHandler()` on your supplied instance to handle thrown errors. Controller and hook errors reach that inherited handler.
-
-Fastify's normal rules also apply to empty responses. Returning `undefined` from the async route handler sends an empty response with the current status, normally 200. Explicitly send `reply.code(204).send()` when you want a 204.
-
-### Override the handler
-
-Provide `handler` to customize decorated routes. It runs per request and receives `request`, `reply`, and `invoke()`. Calling `invoke()` executes the controller with that request and reply. The callback can transform the result, catch errors, or skip controller invocation entirely.
-
-For example, an application can opt into Result unwrapping:
+Define HTTP mappings once. Reuse them to handle failed Results and generate response schemas, so controller types and documented responses stay consistent. Add the handler to the quick start's configuration factory:
 
 ```ts
-import { isResultLike } from "awilixify";
+import {
+  createErrorMapper,
+  createResultSchemaDecorator,
+} from "@awilixify/fastify/typebox";
+import { createResultHandler } from "@awilixify/fastify";
+import { Result } from "awilixify";
+import { httpException } from "awilixify/http";
 
-const HttpModule = FastifyModule({
-	fastifyInstance,
-	handler: async ({ invoke, reply }) => {
-		const result = await invoke();
-		if (reply.sent) return reply;
-		if (isResultLike(result)) {
-			if (!result.ok) throw result.error;
-			return result.value;
-		}
-		return result;
-	},
+class CatsNotFoundError extends Error {
+  readonly code = "cats.not_found";
+}
+
+const errorMapper = createErrorMapper([
+  [CatsNotFoundError, () => httpException.notFound("No cats found")],
+]);
+const resultSchema = createResultSchemaDecorator({ errorMapper });
+
+const HttpModule = configureModule({
+  imports: [HttpInfraModule],
+  inject: ["fastifyInstance"],
+  useFactory: (fastifyInstance) => FastifyModule({
+    fastifyInstance,
+    handler: createResultHandler(errorMapper),
+  }),
 });
 ```
 
-Thrown errors from the override also use Fastify's error handling. The override does not replace lifecycle hooks, validation, or serialization.
-
-## Hooks and route config
-
-Awilixify's `@before` hooks become Fastify `preHandler` hooks. `@after` hooks become `onSend` hooks and must use Fastify's `onSend` signature. Class and method hooks run in Awilixify's rolled-up order: class before, method before, handler, method after, class after.
-
-Use `@schema` from `awilixify/http` for validation and response schemas. Use `@routeConfig` for native Fastify route config, including fields added by installed plugins:
+Select the errors each route documents:
 
 ```ts
-import rateLimit from "@fastify/rate-limit";
-import { routeConfig } from "@awilixify/fastify";
-import { GET } from "awilixify/http";
+const catsSchema = {
+  response: {
+    200: Type.Array(Type.String()),
+    ...errorMapper.toResponseSchemas([CatsNotFoundError]),
+  },
+};
 
-fastifyInstance.register(rateLimit, { global: false });
+class CatsController {
+  @GET("/cats")
+  @resultSchema(catsSchema)
+  list(): Result<string[], CatsNotFoundError> {
+    return Result.error(new CatsNotFoundError());
+  }
+}
+```
+
+The decorator checks that success values fit `response[200]` and every returned error is registered and maps to an allowed route response. Schemas may document additional errors from middleware or validation.
+
+### Mapper methods
+
+- `toHttpError(error)` accepts registered error types and preserves their HTTP status/message types. Use it in controllers for explicit handling.
+- `toHttpErrorFromUnknown(error)` accepts any value and falls back to a generic 500.
+- `toResponseSchemas([ErrorClass, ...])` generates schemas grouped by status, with mapped messages as literals and examples. Swagger display depends on your OpenAPI tooling.
+
+## Thrown errors and custom handling
+
+By default, thrown Awilixify `HttpException`s are sent with their status and response body. Other errors use the existing Fastify error handler, preserving validation errors and custom fallback behavior.
+
+Set `handleHttpExceptions: false` if your application owns all thrown-error handling:
+
+```ts
+const HttpModule = FastifyModule({
+  fastifyInstance,
+  handleHttpExceptions: false,
+});
+```
+
+Use `handler` for other request/response transformations:
+
+```ts
+FastifyModule({
+  fastifyInstance,
+  handler: async ({ invoke, reply }) => {
+    const value = await invoke();
+    if (reply.sent) return reply;
+    return { data: value };
+  },
+});
+```
+
+## Hooks and route options
+
+Awilixify `@before` hooks run as Fastify `preHandler` hooks. `@after` hooks run as `onSend` hooks and must use Fastify's signature. Ordering is class-before, method-before, handler, method-after, class-after.
+
+Use native route config and constraints alongside HTTP decorators:
+
+```ts
+import { routeConfig, routeConstraints } from "@awilixify/fastify";
 
 class SearchController {
-	@GET("/search")
-	@routeConfig({ rateLimit: { max: 20, timeWindow: "1 minute" } })
-	search() {
-		return [];
-	}
+  @GET("/search")
+  @routeConfig({ rateLimit: { max: 20, timeWindow: "1 minute" } })
+  @routeConstraints({ host: "api.example.com", version: "1.0.0" })
+  search() {
+    return [];
+  }
 }
 ```
 
-The rate-limit plugin is an application dependency, not a dependency of this package.
-
-## Route constraints
-
-Use `@routeConstraints()` for Fastify's host, version, or custom routing constraints:
-
-```ts
-import { routeConstraints } from "@awilixify/fastify";
-
-class VersionedController {
-	@GET("/users")
-	@routeConstraints({ host: "api.example.com", version: "1.0.0" })
-	list() {
-		return [];
-	}
-}
-```
-
-Version constraints match the request's `Accept-Version` header. Register custom constraint strategies on the supplied Fastify instance before DI initialization. Stacked decorators shallow-merge their constraints. Like `@routeConfig()`, this decorator applies to methods with HTTP route metadata and does not register a route by itself.
+Install and register any required plugins yourself, such as `@fastify/rate-limit` for the config above. Register custom constraint strategies before DI initialization. Version constraints use the `Accept-Version` header. Stacked config and constraint decorators shallow-merge their values.
 
 ## Shutdown
 
-The application owns the supplied instance and its lifecycle. Register plugins before DI initialization and listen after all routes have been registered, for example in an eager application provider's `afterInit()`. The module never calls `listen()` or `close()`. During shutdown, await `fastifyInstance.close()` before `context.close()` so active requests drain before their dependencies are disposed.
+With the quick start's lifecycle provider, closing the context closes Fastify in `beforeShutdown()`, before DI resources are disposed:
+
+```ts
+await context.close();
+```
+
+If you manage the instance outside DI, call `fastifyInstance.close()` before `context.close()` instead.
 
 ## Development
 
@@ -192,4 +274,3 @@ The application owns the supplied instance and its lifecycle. Register plugins b
 npm install
 npm run build:release
 ```
-# awilixify-fastify

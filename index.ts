@@ -1,4 +1,8 @@
 export {
+	type ApplicationError,
+	createErrorMapper,
+} from "./lib/error-mapper.js";
+export {
 	type FastifyHandler,
 	type FastifyHandlerContext,
 	FastifyModule,
@@ -8,3 +12,4 @@ export {
 	routeConfig,
 	routeConstraints,
 } from "./lib/fastify-route.decorators.js";
+export { createResultHandler } from "./lib/result-handler.js";
