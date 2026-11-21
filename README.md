@@ -160,18 +160,18 @@ Define HTTP mappings once. Reuse them to handle failed Results and generate resp
 import {
   createErrorMapper,
   createResultSchemaDecorator,
+  defineErrorMappings,
 } from "@awilixify/fastify/typebox";
 import { createResultHandler } from "@awilixify/fastify";
 import { Result } from "awilixify";
 import { httpException } from "awilixify/http";
 
-class CatsNotFoundError extends Error {
-  readonly code = "cats.not_found";
-}
+class CatsNotFoundError extends Error {}
 
-const errorMapper = createErrorMapper([
-  [CatsNotFoundError, () => httpException.notFound("No cats found")],
-]);
+const catsErrors = defineErrorMappings({
+  "cats.not_found": [CatsNotFoundError, () => httpException.notFound("No cats found")],
+});
+const errorMapper = createErrorMapper({ ...catsErrors });
 const resultSchema = createResultSchemaDecorator({ errorMapper });
 
 const HttpModule = configureModule({
@@ -190,7 +190,7 @@ Select the errors each route documents:
 const catsSchema = {
   response: {
     200: Type.Array(Type.String()),
-    ...errorMapper.toResponseSchemas([CatsNotFoundError]),
+    ...errorMapper.toResponseSchemas(["cats.not_found"]),
   },
 };
 
@@ -205,11 +205,34 @@ class CatsController {
 
 The decorator checks that success values fit `response[200]` and every returned error is registered and maps to an allowed route response. Schemas may document additional errors from middleware or validation.
 
+### Module maps and default errors
+
+Export each module's registrations through `defineErrorMappings`, then combine them with object spreads:
+
+```ts
+const errorMapper = createErrorMapper(
+  { ...catsErrors, ...authErrors, ...tenantErrors },
+  { defaultErrors: ["auth.unauthorized", "tenant.not_found"] },
+);
+
+errorMapper.toResponseSchemas(); // Defaults only.
+errorMapper.toResponseSchemas(["cats.not_found"]); // Defaults plus route errors.
+errorMapper.toResponseSchemas(["cats.not_found"], {
+  excludeDefaults: ["auth.unauthorized"],
+});
+```
+
+- Keys provide autocomplete and schema selection. Factories define the HTTP status and message shown in Swagger.
+- `defineErrorMappings` preserves literal types without `as const`. Use it for each module before spreading maps to detect duplicate keys. Duplicate constructors also throw.
+- `defaultErrors` documents responses without changing runtime handling. `excludeDefaults` accepts only configured defaults; explicitly selected keys remain included.
+
+TypeScript cannot distinguish structurally identical error classes. Use distinct instance fields or private brands when exact error-type checks are needed. Runtime mapping always matches constructors.
+
 ### Mapper methods
 
 - `toHttpError(error)` accepts registered error types and preserves their HTTP status/message types. Use it in controllers for explicit handling.
 - `toHttpErrorFromUnknown(error)` accepts any value and falls back to a generic 500.
-- `toResponseSchemas([ErrorClass, ...])` generates schemas grouped by status, with mapped messages as literals and examples. Swagger display depends on your OpenAPI tooling.
+- `toResponseSchemas(["module.error", ...])` generates schemas grouped by status, with mapped messages as literals and examples. Swagger display depends on your OpenAPI tooling.
 
 ## Thrown errors and custom handling
 

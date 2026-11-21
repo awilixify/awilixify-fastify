@@ -219,9 +219,12 @@ describe("Fastify module", () => {
 		class CatsError extends Error {
 			readonly code = "cats.not_found";
 		}
-		const errorMapper = createErrorMapper([
-			[CatsError, () => httpException.notFound("cats.not_found")],
-		]);
+		const errorMapper = createErrorMapper({
+			"cats.not_found": [
+				CatsError,
+				() => httpException.notFound("cats.not_found"),
+			],
+		});
 		const mapError = vi.spyOn(errorMapper, "toHttpErrorFromUnknown");
 
 		class Controller {
@@ -294,14 +297,17 @@ describe("Fastify module", () => {
 		class CatsError extends Error {
 			readonly code = "cats.not_found";
 		}
-		const errorMapper = createTypeBoxErrorMapper([
-			[CatsError, () => httpException.notFound("cats.not_found")],
-		]);
+		const errorMapper = createTypeBoxErrorMapper({
+			"cats.not_found": [
+				CatsError,
+				() => httpException.notFound("cats.not_found"),
+			],
+		});
 		const resultSchema = createResultSchemaDecorator({ errorMapper });
 		const routeSchema = {
 			response: {
 				200: Type.Array(Type.String()),
-				...errorMapper.toResponseSchemas([CatsError]),
+				...errorMapper.toResponseSchemas(["cats.not_found"]),
 			},
 		};
 		class Controller {

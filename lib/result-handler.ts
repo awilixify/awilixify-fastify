@@ -1,13 +1,10 @@
 import { isResultLike } from "awilixify";
-import type { ErrorMapper, ErrorMapping } from "./error-mapper.js";
+import type { ErrorMapper, ErrorMappings } from "./error-mapper.js";
 import type { FastifyHandler } from "./fastify.module.js";
 
 /** Unwrap Results and send mapped error responses; leave plain responses unchanged. */
 export function createResultHandler(
-	errorMapper: Pick<
-		ErrorMapper<readonly ErrorMapping[]>,
-		"toHttpErrorFromUnknown"
-	>,
+	errorMapper: Pick<ErrorMapper<ErrorMappings>, "toHttpErrorFromUnknown">,
 ): FastifyHandler {
 	return async ({ invoke, reply }) => {
 		const result = await invoke();

@@ -21,17 +21,23 @@ class AuthError extends Error {
 class UnmappedError extends Error {
 	readonly code = "unmapped";
 }
-const errorMapper = createErrorMapper([
-	[CatsError, () => httpException.notFound("cats.not_found")],
-	[TenantError, () => httpException.notFound("tenant.not_found")],
-	[AuthError, () => httpException.unauthorized("auth.unauthorized")],
-]);
+const errorMapper = createErrorMapper({
+	"cats.not_found": [CatsError, () => httpException.notFound("cats.not_found")],
+	"tenant.not_found": [
+		TenantError,
+		() => httpException.notFound("tenant.not_found"),
+	],
+	"auth.unauthorized": [
+		AuthError,
+		() => httpException.unauthorized("auth.unauthorized"),
+	],
+});
 const resultSchema = createResultSchemaDecorator({ errorMapper });
 const routeSchema = {
 	params: Type.Object({ id: Type.String() }),
 	response: {
 		200: Type.Array(Type.String()),
-		...errorMapper.toResponseSchemas([CatsError]),
+		...errorMapper.toResponseSchemas(["cats.not_found"]),
 	},
 };
 const decorate = resultSchema(routeSchema);
@@ -243,5 +249,64 @@ test("matches string status keys, content schemas, and wildcard/default preceden
 	expect(exactFirst).type.not.toBeCallableWith(
 		Controller.prototype.tenant,
 		methodContext(Controller.prototype.tenant),
+	);
+});
+
+test("matches mapped errors and default responses", () => {
+	class MissingCat extends Error {
+		readonly catId = "cat";
+	}
+	class MissingTenant extends Error {
+		readonly tenantId = "tenant";
+	}
+	class Unregistered extends Error {
+		readonly otherId = "other";
+	}
+	const mapper = createErrorMapper(
+		{
+			"cats.missing": [MissingCat, () => httpException.notFound("Missing cat")],
+			"tenants.missing": [
+				MissingTenant,
+				() => httpException.notFound("Missing tenant"),
+			],
+		},
+		{ defaultErrors: ["tenants.missing"] },
+	);
+	const decorator = createResultSchemaDecorator({ errorMapper: mapper });
+	const withDefaults = decorator({
+		response: mapper.toResponseSchemas(["cats.missing"]),
+	});
+	const withoutDefaults = decorator({
+		response: mapper.toResponseSchemas(["cats.missing"], {
+			excludeDefaults: ["tenants.missing"],
+		}),
+	});
+	class Controller {
+		cats() {
+			return Result.error(new MissingCat());
+		}
+		tenants() {
+			return Result.error(new MissingTenant());
+		}
+		unregistered() {
+			return Result.error(new Unregistered());
+		}
+	}
+
+	expect(withDefaults).type.toBeCallableWith(
+		Controller.prototype.cats,
+		methodContext(Controller.prototype.cats),
+	);
+	expect(withDefaults).type.toBeCallableWith(
+		Controller.prototype.tenants,
+		methodContext(Controller.prototype.tenants),
+	);
+	expect(withoutDefaults).type.not.toBeCallableWith(
+		Controller.prototype.tenants,
+		methodContext(Controller.prototype.tenants),
+	);
+	expect(withDefaults).type.not.toBeCallableWith(
+		Controller.prototype.unregistered,
+		methodContext(Controller.prototype.unregistered),
 	);
 });

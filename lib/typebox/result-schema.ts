@@ -4,8 +4,9 @@ import {
 	type RouteSchema,
 } from "awilixify/http";
 import type {
+	ErrorKey,
 	ErrorMapper,
-	ErrorMapping,
+	ErrorMappings,
 	MappedException,
 } from "../error-mapper.js";
 import type {
@@ -70,20 +71,23 @@ type UndeclaredException<S extends RouteSchema, Exception> =
 //  2. Its mapped HTTP response must fit the route's response schema.
 type MatchingResultErrors<
 	S extends RouteSchema,
-	Mappings extends readonly ErrorMapping[],
+	Mappings extends ErrorMappings,
 	Errors,
 > =
 	IsAny<Errors> extends true
 		? SchemaMismatch<
 				"Result error must not be any",
-				InstanceType<Mappings[number][0]>,
+				InstanceType<Mappings[ErrorKey<Mappings>][0]>,
 				Errors
 			>
-		: [Errors] extends [InstanceType<Mappings[number][0]>]
-			? MatchingMappedErrors<S, MappedException<Mappings[number], Errors>>
+		: [Errors] extends [InstanceType<Mappings[ErrorKey<Mappings>][0]>]
+			? MatchingMappedErrors<
+					S,
+					MappedException<Mappings[ErrorKey<Mappings>], Errors>
+				>
 			: SchemaMismatch<
 					"Result errors must be registered in the error mapper",
-					InstanceType<Mappings[number][0]>,
+					InstanceType<Mappings[ErrorKey<Mappings>][0]>,
 					Errors
 				>;
 
@@ -103,7 +107,7 @@ type MatchingMappedErrors<S extends RouteSchema, Exception> = [
 
 /** Type-check plain and Result returns. Result unwrapping still requires a custom request handler. */
 export function createResultSchemaDecorator<
-	const Mappings extends readonly ErrorMapping[],
+	const Mappings extends ErrorMappings,
 >(_options: { errorMapper: ErrorMapper<Mappings> }) {
 	return <const S extends RouteSchema>(routeSchema: S) => {
 		const decorate = httpSchema(routeSchema);

@@ -1,6 +1,8 @@
 export {
-	type ApplicationError,
 	createErrorMapper,
+	defineErrorMappings,
+	type ErrorMapping,
+	type ErrorMappings,
 } from "./lib/error-mapper.js";
 export {
 	type FastifyHandler,
